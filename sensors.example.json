@@ -1,0 +1,19 @@
+{
+  "area":      { "xmin": 0, "ymin": 0, "xmax": 20, "ymax": 15 },
+  "path_loss": { "rssi_at_1m": -40.0, "exponent": 3.0 },
+  "window_sec": 6.0,
+  "min_sensors": 3,
+  "track_all_aps": true,
+
+  "sensors": [
+    { "id": "pi-1", "x": 0.0,  "y": 0.0,  "rssi_offset": 0.0 },
+    { "id": "pi-2", "x": 20.0, "y": 0.0,  "rssi_offset": 0.0 },
+    { "id": "pi-3", "x": 20.0, "y": 15.0, "rssi_offset": 0.0 },
+    { "id": "pi-4", "x": 0.0,  "y": 15.0, "rssi_offset": 0.0 }
+  ],
+
+  "targets": [
+    { "mac": "aa:bb:cc:dd:ee:01", "name": "AP-Lobby" },
+    { "mac": "aa:bb:cc:dd:ee:02", "name": "AP-Warehouse" }
+  ]
+}

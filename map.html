@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RSSI live map</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; height: 100%; background: #0e1116; color: #e6edf3;
+    font: 13px/1.4 -apple-system, Segoe UI, Roboto, sans-serif; }
+  #wrap { position: fixed; inset: 0; }
+  canvas { display: block; width: 100%; height: 100%; }
+  #hud { position: fixed; top: 10px; left: 10px; background: rgba(20,24,31,.82);
+    border: 1px solid #2a313c; border-radius: 8px; padding: 8px 11px;
+    min-width: 190px; backdrop-filter: blur(3px); }
+  #hud h1 { font-size: 12px; margin: 0 0 6px; letter-spacing: .4px;
+    text-transform: uppercase; color: #9db2c9; font-weight: 600; }
+  #hud .row { display: flex; justify-content: space-between; gap: 14px; }
+  #hud .k { color: #8b97a5; }
+  #dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+    background: #f2544b; margin-right: 5px; vertical-align: 1px; }
+  #dot.ok { background: #3fb950; }
+  #legend { position: fixed; bottom: 10px; left: 10px; background: rgba(20,24,31,.82);
+    border: 1px solid #2a313c; border-radius: 8px; padding: 7px 10px; }
+  #legend span { margin-right: 12px; }
+  .sw { display: inline-block; width: 10px; height: 10px; border-radius: 2px;
+    margin-right: 4px; vertical-align: -1px; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<div id="hud">
+  <h1>RSSI live map</h1>
+  <div class="row"><span class="k">feed</span><span id="feed">—</span></div>
+  <div class="row"><span class="k">status</span><span><span id="dot"></span><span id="state">connecting</span></span></div>
+  <div class="row"><span class="k">targets</span><span id="ntargets">0</span></div>
+  <div class="row"><span class="k">updated</span><span id="age">—</span></div>
+</div>
+<div id="legend">
+  <span><i class="sw" style="background:#f0b429"></i>AP</span>
+  <span><i class="sw" style="background:#58a6ff"></i>client</span>
+  <span><i class="sw" style="background:#8b949e"></i>sensor</span>
+  <span><i class="sw" style="background:#3fb95055;border:1px solid #3fb950"></i>uncertainty</span>
+</div>
+<script>
+// Feed base URL: ?feed=http://host:8090  (default: same origin that served this)
+const params = new URLSearchParams(location.search);
+const FEED = (params.get('feed') || '').replace(/\/$/, '');
+document.getElementById('feed').textContent = FEED || 'same-origin';
+
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d');
+let dpr = Math.max(1, window.devicePixelRatio || 1);
+let W = 0, H = 0;
+function resize() {
+  dpr = Math.max(1, window.devicePixelRatio || 1);
+  W = cv.clientWidth; H = cv.clientHeight;
+  cv.width = W * dpr; cv.height = H * dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  draw();
+}
+window.addEventListener('resize', resize);
+
+let snapshot = null;      // last feed payload
+let lastTs = 0;
+const bg = new Image();
+let bgReady = false;
+let bgUrl = null;
+bg.onload = () => { bgReady = true; draw(); };
+
+// Build a metres -> canvas-pixel transform for the current payload.
+function makeTransform(area, map) {
+  const pad = 34;
+  if (map && map.image_url && map.px_per_m && map.origin_px && bgReady) {
+    // Fit the floor-plan image into the canvas, then place metres via its scale.
+    const s = Math.min(W / bg.naturalWidth, H / bg.naturalHeight);
+    const dw = bg.naturalWidth * s, dh = bg.naturalHeight * s;
+    const ox = (W - dw) / 2, oy = (H - dh) / 2;
+    const ppm = map.px_per_m, [gx, gy] = map.origin_px;
+    const yd = map.y_down !== false; // default: image y grows downward
+    return {
+      img: { ox, oy, dw, dh },
+      mppx: ppm * s,                 // canvas px per metre
+      x: m => ox + (gx + m * ppm) * s,
+      y: m => oy + (gy + (yd ? m : -m) * ppm) * s,
+    };
+  }
+  // Plain grid: fit the area rectangle into the canvas, y up.
+  const w = area.xmax - area.xmin, h = area.ymax - area.ymin;
+  const s = Math.min((W - 2 * pad) / (w || 1), (H - 2 * pad) / (h || 1));
+  const ox = (W - w * s) / 2, oy = (H - h * s) / 2;
+  return {
+    img: null, mppx: s,
+    x: mx => ox + (mx - area.xmin) * s,
+    y: my => H - oy - (my - area.ymin) * s,
+  };
+}
+
+function draw() {
+  ctx.clearRect(0, 0, W, H);
+  ctx.fillStyle = '#0e1116'; ctx.fillRect(0, 0, W, H);
+  if (!snapshot) return;
+  const area = snapshot.area, map = snapshot.map;
+  const T = makeTransform(area, map);
+
+  if (T.img && bgReady) {
+    ctx.globalAlpha = 0.9;
+    ctx.drawImage(bg, T.img.ox, T.img.oy, T.img.dw, T.img.dh);
+    ctx.globalAlpha = 1;
+  } else {
+    // grid
+    ctx.strokeStyle = '#1b2230'; ctx.lineWidth = 1;
+    for (let gx = Math.ceil(area.xmin); gx <= area.xmax; gx++) {
+      ctx.beginPath(); ctx.moveTo(T.x(gx), T.y(area.ymin));
+      ctx.lineTo(T.x(gx), T.y(area.ymax)); ctx.stroke();
+    }
+    for (let gy = Math.ceil(area.ymin); gy <= area.ymax; gy++) {
+      ctx.beginPath(); ctx.moveTo(T.x(area.xmin), T.y(gy));
+      ctx.lineTo(T.x(area.xmax), T.y(gy)); ctx.stroke();
+    }
+    ctx.strokeStyle = '#2a3444';
+    ctx.strokeRect(T.x(area.xmin), T.y(area.ymax),
+      (area.xmax - area.xmin) * T.mppx, (area.ymax - area.ymin) * T.mppx);
+  }
+
+  // sensors
+  for (const s of (snapshot.sensors || [])) {
+    const x = T.x(s.x), y = T.y(s.y);
+    ctx.fillStyle = '#8b949e';
+    ctx.fillRect(x - 5, y - 5, 10, 10);
+    ctx.fillStyle = '#c9d1d9'; ctx.font = '11px sans-serif';
+    ctx.fillText(s.id, x + 8, y + 4);
+  }
+
+  // targets
+  for (const t of (snapshot.targets || [])) {
+    const x = T.x(t.x), y = T.y(t.y);
+    const isAp = (t.kind || 'ap') === 'ap';
+    const col = isAp ? '#f0b429' : '#58a6ff';
+    if (t.residual_m) {                       // uncertainty ring
+      ctx.beginPath();
+      ctx.arc(x, y, Math.max(4, t.residual_m * T.mppx), 0, 2 * Math.PI);
+      ctx.strokeStyle = isAp ? '#f0b42955' : '#58a6ff55';
+      ctx.lineWidth = 1.5; ctx.stroke();
+    }
+    ctx.beginPath(); ctx.arc(x, y, 6, 0, 2 * Math.PI);
+    ctx.fillStyle = col; ctx.fill();
+    ctx.fillStyle = '#e6edf3'; ctx.font = '12px sans-serif';
+    const label = (t.name || t.mac) +
+      (t.channel ? '  ch' + t.channel : '') +
+      (t.residual_m != null ? '  ±' + t.residual_m + 'm' : '');
+    ctx.fillText(label, x + 10, y - 8);
+  }
+}
+
+// ---- feed connection: SSE with polling fallback ----
+const dot = document.getElementById('dot');
+const stateEl = document.getElementById('state');
+function setState(ok, text) {
+  dot.className = ok ? 'ok' : ''; stateEl.textContent = text;
+}
+function ingest(payload) {
+  snapshot = payload; lastTs = Date.now();
+  document.getElementById('ntargets').textContent =
+    (payload.targets || []).length;
+  const mu = payload.map && payload.map.image_url;
+  const url = mu ? (FEED + mu) : null;
+  if (url && url !== bgUrl) { bgUrl = url; bgReady = false; bg.src = url; }
+  draw();
+}
+function connectSSE() {
+  try {
+    const es = new EventSource(FEED + '/stream');
+    es.onopen = () => setState(true, 'live (SSE)');
+    es.onmessage = e => { try { ingest(JSON.parse(e.data)); } catch (_) {} };
+    es.onerror = () => { setState(false, 'reconnecting'); es.close();
+      setTimeout(connectSSE, 2000); };
+  } catch (_) { poll(); }
+}
+async function poll() {
+  try {
+    const r = await fetch(FEED + '/positions');
+    ingest(await r.json()); setState(true, 'live (poll)');
+  } catch (_) { setState(false, 'offline'); }
+  setTimeout(poll, 1500);
+}
+setInterval(() => {
+  const el = document.getElementById('age');
+  el.textContent = lastTs ? ((Date.now() - lastTs) / 1000).toFixed(1) + 's' : '—';
+}, 250);
+
+resize();
+if (!!window.EventSource) connectSSE(); else poll();
+</script>
+</body>
+</html>
