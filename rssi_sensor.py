@@ -21,11 +21,13 @@ radiotap/802.11 parser and exits. Standard library only, Python 3.7+.
 import argparse
 import json
 import math
+import os
 import socket
 import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.request
 from collections import defaultdict
 
@@ -392,21 +394,59 @@ def mock_capture(batch, args, stop):
 # Reporting
 # --------------------------------------------------------------------------- #
 
+def resolve_token(args) -> str:
+    """The collector token: --token, else SENSOR_TOKEN, else none.
+
+    Environment first in practice, because a token passed as --token sits in
+    `ps` output for every user on the host, continuously, for as long as the
+    sensor runs. That is the same defect fixed for the exporter's console
+    password in #9, and a sensor daemon has an even longer exposure than a
+    scheduled subprocess.
+
+    Empty is allowed: the standalone locator wants no token, and refusing to
+    start would break the setup this tool was written for.
+    """
+    return (args.token or os.environ.get("SENSOR_TOKEN") or "").strip()
+
+
 def report_loop(batch, args, stop):
     url = args.collector.rstrip("/") + "/report"
+    token = resolve_token(args)
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["X-Sensor-Token"] = token
+    warned = set()
     while not stop.is_set():
         stop.wait(args.interval)
         dets = batch.drain()
         if not dets:
             continue
         body = json.dumps({"sensor_id": args.id, "detections": dets}).encode()
-        req = urllib.request.Request(url, body,
-                                     {"Content-Type": "application/json"})
+        req = urllib.request.Request(url, body, headers)
         try:
             urllib.request.urlopen(req, timeout=5).read()
             if args.verbose:
                 print("[report] %d transmitters -> %s" % (len(dets), url),
                       file=sys.stderr)
+        except urllib.error.HTTPError as exc:
+            # Name the auth failures once each. They repeat every interval, and
+            # a wall of identical "POST failed: HTTP Error 401" buries the one
+            # line that says what to do about it.
+            hint = {
+                401: "the collector rejected the token — set SENSOR_TOKEN to "
+                     "match the bridge's",
+                503: "the collector has no token configured and refuses "
+                     "reports — set SENSOR_TOKEN on the bridge",
+                400: "the collector rejected the report — is --id one of its "
+                     "configured sensor ids?",
+                404: "no /report endpoint — is SENSORS_ENABLED=true on the "
+                     "bridge?",
+            }.get(exc.code)
+            if hint and exc.code not in warned:
+                warned.add(exc.code)
+                print("[report] HTTP %d: %s" % (exc.code, hint), file=sys.stderr)
+            elif not hint:
+                print("[report] POST failed: %s" % exc, file=sys.stderr)
         except Exception as exc:
             print("[report] POST failed: %s" % exc, file=sys.stderr)
 
@@ -468,6 +508,12 @@ def main(argv=None):
         formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--collector", help="locator base URL, e.g. http://host:8090")
     p.add_argument("--id", help="this sensor's id (must match the locator config)")
+    p.add_argument("--token", default="",
+                   help="collector token, sent as X-Sensor-Token. PREFER the "
+                        "SENSOR_TOKEN environment variable: an argument is "
+                        "visible in `ps` to every user on this host, for as "
+                        "long as the sensor runs. Not needed by the standalone "
+                        "locator; required by unifi-hamina-live.")
     p.add_argument("--iface", action="append", default=[],
                    help="monitor interface, optionally name@channel (repeatable)")
     p.add_argument("--capture", choices=["aps", "clients", "all"],
