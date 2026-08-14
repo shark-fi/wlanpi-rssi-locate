@@ -391,6 +391,135 @@ def mock_capture(batch, args, stop):
 
 
 # --------------------------------------------------------------------------- #
+# BLE capture (Linux HCI)
+# --------------------------------------------------------------------------- #
+#
+# Why raw HCI rather than shelling out to bluetoothctl: this file is stdlib-only
+# and parsing a human-facing CLI's output is a moving target. Python's socket
+# module speaks AF_BLUETOOTH/BTPROTO_HCI on Linux, so the advertising reports
+# arrive as bytes we decode ourselves — the same relationship this tool already
+# has with radiotap.
+#
+# What this can and cannot hear, established by scanning a real house: devices
+# that ADVERTISE are visible (BLE bulbs, phones, beacons, tags). A device already
+# in a CONNECTION is not — it hops the 37 data channels with a connection-
+# specific access address, and following that needs a sniffer, not an adapter.
+# UniFi's UP Sense sensors are in that second group: 27 other devices showed up
+# in a scan and not one sensor did.
+#
+# Addresses are not stable. Phones and watches rotate a random address every
+# ~15 minutes, so they can be located now but not tracked across a day. Fixed
+# kit (bulbs, beacons) keeps a static address and can be followed indefinitely
+# — which also makes it the right thing to calibrate path loss against.
+
+HCI_EVENT_PKT = 0x04
+HCI_LE_META = 0x3E
+LE_ADVERTISING_REPORT = 0x02
+SOL_HCI, HCI_FILTER = 0, 2
+
+
+def ble_addr(raw):
+    """6 little-endian bytes -> the aa:bb:cc form the collector keys on."""
+    return ":".join("%02x" % b for b in reversed(raw))
+
+
+def ble_local_name(data):
+    """Complete (0x09) or shortened (0x08) local name from the AD structures."""
+    i = 0
+    while i + 1 < len(data):
+        ln = data[i]
+        if ln == 0 or i + ln >= len(data) + 1:
+            break
+        typ = data[i + 1]
+        if typ in (0x08, 0x09):
+            try:
+                return data[i + 2:i + 1 + ln].decode("utf-8", "replace").strip()
+            except Exception:                      # noqa: BLE001 - name is optional
+                return None
+        i += ln + 1
+    return None
+
+
+def parse_le_advertising_report(pkt):
+    """Decode one HCI event packet into [(mac, rssi, name), ...].
+
+    Returns [] for anything that is not an LE Advertising Report, so the read
+    loop can hand it every packet without pre-filtering.
+
+    The RSSI is the LAST byte of each report, after a variable-length AD
+    payload — read it by walking the reports, never from a fixed offset.
+    """
+    if len(pkt) < 5 or pkt[0] != HCI_EVENT_PKT or pkt[1] != HCI_LE_META:
+        return []
+    if pkt[3] != LE_ADVERTISING_REPORT:
+        return []
+    out, n, i = [], pkt[4], 5
+    for _ in range(n):
+        if i + 9 > len(pkt):
+            break
+        addr = pkt[i + 2:i + 8]
+        data_len = pkt[i + 8]
+        data = pkt[i + 9:i + 9 + data_len]
+        rssi_at = i + 9 + data_len
+        if rssi_at >= len(pkt):
+            break
+        rssi = pkt[rssi_at] - 256 if pkt[rssi_at] > 127 else pkt[rssi_at]
+        out.append((ble_addr(addr), float(rssi), ble_local_name(data)))
+        i = rssi_at + 1
+    return out
+
+
+def _hci_cmd(ogf, ocf, params=b""):
+    return (bytes([0x01]) + struct.pack("<H", (ogf << 10) | ocf)
+            + bytes([len(params)]) + params)
+
+
+def ble_capture(batch, args, stop):
+    """Passive LE scan on hci<dev>, reporting every advertiser it hears."""
+    try:
+        sock = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_RAW,
+                             socket.BTPROTO_HCI)
+        sock.bind((args.ble_dev,))
+    except (AttributeError, OSError) as exc:
+        print("[ble] cannot open hci%d: %s" % (args.ble_dev, exc), file=sys.stderr)
+        print("[ble] needs Linux and root; check `hciconfig hci%d up`"
+              % args.ble_dev, file=sys.stderr)
+        return
+    # Only HCI event packets, and of those only LE Meta (0x3E).
+    sock.setsockopt(SOL_HCI, HCI_FILTER,
+                    struct.pack("<LLLH", 1 << HCI_EVENT_PKT, 0,
+                                1 << (HCI_LE_META - 32), 0))
+    # passive scan, 10 ms window every 10 ms — duplicates ON, because every
+    # repeat advertisement is another RSSI sample and averaging them is the
+    # entire point.
+    sock.send(_hci_cmd(0x08, 0x000B,
+                       struct.pack("<BHHBB", 0x00, 0x0010, 0x0010, 0x00, 0x00)))
+    sock.send(_hci_cmd(0x08, 0x000C, struct.pack("<BB", 0x01, 0x00)))
+    if args.verbose:
+        print("[ble] scanning on hci%d" % args.ble_dev, file=sys.stderr)
+    sock.settimeout(1.0)
+    try:
+        while not stop.is_set():
+            try:
+                pkt = sock.recv(1024)
+            except socket.timeout:
+                continue
+            except OSError as exc:
+                print("[ble] read failed: %s" % exc, file=sys.stderr)
+                return
+            for mac, rssi, name in parse_le_advertising_report(pkt):
+                if args.macs and mac not in args.macs:
+                    continue
+                batch.add(mac, rssi, "ble", None, name)
+    finally:
+        try:
+            sock.send(_hci_cmd(0x08, 0x000C, struct.pack("<BB", 0x00, 0x00)))
+            sock.close()
+        except OSError:
+            pass
+
+
+# --------------------------------------------------------------------------- #
 # Reporting
 # --------------------------------------------------------------------------- #
 
@@ -455,6 +584,34 @@ def report_loop(batch, args, stop):
 # Self-test
 # --------------------------------------------------------------------------- #
 
+def _ble_selftest():
+    """One real-shaped LE Advertising Report, decoded.
+
+    Two reports in one event, a name in the AD payload, and a negative RSSI as
+    the LAST byte after a variable-length payload — which is the detail that
+    makes a fixed offset wrong.
+    """
+    name = b"\x07\x09Govee1"                       # complete local name
+    r1 = (bytes([0x00, 0x00]) + bytes([0x4e, 0x3d, 0x1f, 0x38, 0xc1, 0xa4])
+          + bytes([len(name)]) + name + bytes([256 - 80]))     # -80 dBm
+    r2 = (bytes([0x00, 0x01]) + bytes([0x40, 0x45, 0xa8, 0x79, 0x3a, 0xa8])
+          + bytes([0x00]) + bytes([256 - 52]))                 # -52, no AD data
+    pkt = bytes([HCI_EVENT_PKT, HCI_LE_META, 0, LE_ADVERTISING_REPORT, 2]) + r1 + r2
+    got = parse_le_advertising_report(pkt)
+    want = [("a4:c1:38:1f:3d:4e", -80.0, "Govee1"),
+            ("a8:3a:79:a8:45:40", -52.0, None)]
+    if got != want:
+        print("BLE selftest FAILED\n  got  %r\n  want %r" % (got, want),
+              file=sys.stderr)
+        return False
+    if parse_le_advertising_report(bytes([HCI_EVENT_PKT, 0x0E, 0, 0])) != []:
+        print("BLE selftest FAILED: non-advertising event was decoded",
+              file=sys.stderr)
+        return False
+    print("ble selftest OK: 2 report(s), -80/-52 dBm, name 'Govee1'")
+    return True
+
+
 def selftest():
     # Radiotap with Flags(1), Rate(2), Channel(3), dBm-antsignal(5) present.
     present = (1 << 1) | (1 << 2) | (1 << 3) | (1 << 5)   # 0x2E
@@ -514,6 +671,14 @@ def main(argv=None):
                         "visible in `ps` to every user on this host, for as "
                         "long as the sensor runs. Not needed by the standalone "
                         "locator; required by unifi-hamina-live.")
+    p.add_argument("--ble", action="store_true",
+                   help="also scan BLE advertisements on hci0 and report them "
+                        "as kind=ble. Hears advertisers (bulbs, phones, "
+                        "beacons, tags); CANNOT hear a device already in a "
+                        "connection, which is where UniFi's UP Sense sensors "
+                        "live. Needs root.")
+    p.add_argument("--ble-dev", type=int, default=0, metavar="N",
+                   help="HCI device index for --ble (default 0 = hci0)")
     p.add_argument("--iface", action="append", default=[],
                    help="monitor interface, optionally name@channel (repeatable)")
     p.add_argument("--capture", choices=["aps", "clients", "all"],
@@ -543,7 +708,7 @@ def main(argv=None):
     args.macs = [m.strip() for m in args.macs.split(",") if m.strip()]
 
     if args.selftest:
-        return selftest()
+        return 0 if (selftest() == 0 and _ble_selftest()) else 1
     if args.calibrate:
         return calibrate(args)
     if not args.collector or not args.id:
@@ -558,8 +723,8 @@ def main(argv=None):
         threads.append(threading.Thread(target=mock_capture,
                                         args=(batch, args, stop), daemon=True))
     else:
-        if not ifaces:
-            p.error("at least one --iface is required in live mode")
+        if not ifaces and not args.ble:
+            p.error("at least one --iface (or --ble) is required in live mode")
         for name, ch in ifaces:
             if args.setup:
                 setup_monitor(name, ch, args.verbose)
@@ -568,6 +733,10 @@ def main(argv=None):
             threads.append(threading.Thread(
                 target=capture_iface, args=(name, ch, batch, args, stop),
                 daemon=True))
+
+    if args.ble and not args.mock:
+        threads.append(threading.Thread(target=ble_capture,
+                                        args=(batch, args, stop), daemon=True))
 
     threads.append(threading.Thread(target=report_loop,
                                     args=(batch, args, stop), daemon=True))
