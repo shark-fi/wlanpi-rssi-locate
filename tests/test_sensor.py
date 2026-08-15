@@ -188,3 +188,34 @@ class ImportsUsedAtRuntime(unittest.TestCase):
                              "urllib", "getpass", "hashlib", "re", "zipfile"}}
         self.assertEqual(suspects, set(),
                          f"used but not imported: {sorted(suspects)}")
+
+
+class HciFilterStruct(unittest.TestCase):
+    """The socket option the kernel accepts, byte for byte.
+
+    setsockopt returned EINVAL on a real WLAN Pi because the filter was packed
+    from its fields (14 bytes) rather than the struct's sizeof (16). "Invalid
+    argument" says nothing about padding, and nothing in the selftest or the
+    unit tests touches a socket — so it took a deployment to find.
+    """
+
+    def test_it_is_the_sixteen_bytes_sizeof_reports(self):
+        from rssi_sensor import hci_filter
+        self.assertEqual(len(hci_filter(0x3E)), 16,
+                         "the kernel rejects anything shorter than sizeof")
+
+    def test_a_high_event_code_sets_the_upper_mask(self):
+        """LE Meta is 0x3E — bit 62, in the second word of the 64-bit mask."""
+        import struct as _s
+        from rssi_sensor import hci_filter
+        type_mask, lo, hi, opcode = _s.unpack("<LLLH2x", hci_filter(0x3E))
+        self.assertEqual(lo, 0)
+        self.assertEqual(hi, 1 << (0x3E - 32))
+        self.assertEqual(type_mask, 1 << 0x04, "HCI event packets only")
+        self.assertEqual(opcode, 0)
+
+    def test_a_low_event_code_sets_the_lower_mask(self):
+        import struct as _s
+        from rssi_sensor import hci_filter
+        _t, lo, hi, _o = _s.unpack("<LLLH2x", hci_filter(0x05))
+        self.assertEqual((lo, hi), (1 << 5, 0))

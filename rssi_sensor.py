@@ -470,6 +470,27 @@ def parse_le_advertising_report(pkt):
     return out
 
 
+def hci_filter(event_code):
+    """The 16-byte struct hci_ufilter the kernel expects.
+
+        struct hci_ufilter { __u32 type_mask; __u32 event_mask[2]; __u16 opcode; }
+
+    Its FIELDS are 14 bytes, but C pads the struct to a 4-byte boundary, so
+    sizeof() is 16 — and the kernel rejects anything shorter than sizeof with
+    EINVAL rather than accepting a short read. Packing the fields alone gives
+    14 and setsockopt fails with "Invalid argument", which says nothing about
+    two bytes of padding. Hence the explicit 2x.
+
+    Event codes above 31 live in the second half of the 64-bit event mask.
+    """
+    mask_lo = mask_hi = 0
+    if event_code < 32:
+        mask_lo = 1 << event_code
+    else:
+        mask_hi = 1 << (event_code - 32)
+    return struct.pack("<LLLH2x", 1 << HCI_EVENT_PKT, mask_lo, mask_hi, 0)
+
+
 def _hci_cmd(ogf, ocf, params=b""):
     return (bytes([0x01]) + struct.pack("<H", (ogf << 10) | ocf)
             + bytes([len(params)]) + params)
@@ -487,9 +508,7 @@ def ble_capture(batch, args, stop):
               % args.ble_dev, file=sys.stderr)
         return
     # Only HCI event packets, and of those only LE Meta (0x3E).
-    sock.setsockopt(SOL_HCI, HCI_FILTER,
-                    struct.pack("<LLLH", 1 << HCI_EVENT_PKT, 0,
-                                1 << (HCI_LE_META - 32), 0))
+    sock.setsockopt(SOL_HCI, HCI_FILTER, hci_filter(HCI_LE_META))
     # passive scan, 10 ms window every 10 ms — duplicates ON, because every
     # repeat advertisement is another RSSI sample and averaging them is the
     # entire point.
