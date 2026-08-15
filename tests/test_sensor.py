@@ -148,3 +148,43 @@ class BleLocalName(unittest.TestCase):
 
     def test_a_zero_length_structure_terminates_instead_of_looping(self):
         self.assertIsNone(ble_local_name(b"\x00\x00\x00"))
+
+
+class ImportsUsedAtRuntime(unittest.TestCase):
+    """Every module the file references must actually be imported.
+
+    ble_capture() reached `struct.pack` on a NameError because `struct` was
+    never imported. Nothing caught it: the selftest exercises the parser, the
+    unit tests exercise pure functions, and the socket path only runs on real
+    hardware with root. It failed on a WLAN Pi, in a thread, after deployment.
+    """
+
+    def test_every_module_referenced_is_imported(self):
+        import ast
+        import os
+
+        src = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                           "rssi_sensor.py")
+        tree = ast.parse(open(src).read())
+        imported = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for a in node.names:
+                    imported.add((a.asname or a.name).split(".")[0])
+            elif isinstance(node, ast.ImportFrom):
+                for a in node.names:
+                    imported.add(a.asname or a.name)
+
+        # every `name.attr` where `name` looks like a stdlib module we use
+        used = set()
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)):
+                used.add(node.value.id)
+
+        builtins_and_locals = used - imported
+        suspects = {n for n in builtins_and_locals
+                    if n in {"struct", "socket", "json", "math", "os", "sys",
+                             "time", "threading", "subprocess", "argparse",
+                             "urllib", "getpass", "hashlib", "re", "zipfile"}}
+        self.assertEqual(suspects, set(),
+                         f"used but not imported: {sorted(suspects)}")
