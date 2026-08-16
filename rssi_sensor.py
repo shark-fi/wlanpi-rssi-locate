@@ -307,10 +307,80 @@ def capture_samples(iface, seconds, macs, capture, verbose):
     return got
 
 
+def solve_two_point(d1, r1, d2, r2):
+    """Both constants from two measurements at different distances.
+
+    RSSI(d) = A - 10*n*log10(d), so two points determine A and n exactly:
+
+        n = (r1 - r2) / (10 * (log10(d2) - log10(d1)))
+        A = r1 + 10*n*log10(d1)
+
+    One distance can only give A for an ASSUMED n, and n is the number that
+    describes the building — the one worth measuring rather than guessing.
+    Use distances far apart: two readings a metre apart differ by little more
+    than the noise, and the exponent then comes out of the noise.
+    """
+    if d1 <= 0 or d2 <= 0:
+        raise ValueError("distances must be positive")
+    if abs(math.log10(d2) - math.log10(d1)) < 1e-9:
+        raise ValueError("the two distances must differ")
+    n = (r1 - r2) / (10.0 * (math.log10(d2) - math.log10(d1)))
+    a1m = r1 + 10.0 * n * math.log10(d1)
+    return a1m, n
+
+
+def ble_calibrate_samples(args):
+    """Collect BLE advertisements for --seconds. mac -> {"rssi": [...], "name"}.
+
+    Same shape capture_samples returns for Wi-Fi, so the reporting below does
+    not care which radio produced the numbers.
+    """
+    got = {}
+    stop = threading.Event()
+
+    class _Sink:
+        def add(self, mac, rssi, kind, channel, name):
+            rec = got.setdefault(mac, {"rssi": [], "name": None})
+            rec["rssi"].append(rssi)
+            rec["name"] = rec["name"] or name
+
+    t = threading.Thread(target=ble_capture, args=(_Sink(), args, stop),
+                         daemon=True)
+    t.start()
+    deadline = time.time() + args.seconds
+    while time.time() < deadline and t.is_alive():
+        time.sleep(0.2)
+    stop.set()
+    t.join(timeout=2.0)
+    return got
+
+
 def calibrate(args):
-    """Measure RSSI to derive rssi_at_1m and per-sensor offsets for the config."""
+    """Measure RSSI to derive rssi_at_1m and per-sensor offsets for the config.
+
+    BLE needs its own measurement, not the Wi-Fi one scaled: a bulb or a tag
+    transmits around 0 dBm where an AP runs about 20, so an intercept borrowed
+    from Wi-Fi overestimates every BLE distance. Deployed with the default of
+    -50 dBm, real bulbs came back 11-16 m away inside a 21 m house, which put
+    most fixes outside the building.
+    """
+    if args.ble:
+        print("Calibrating BLE on hci%d for %ds — keep the target still at %s ..."
+              % (args.ble_dev, args.seconds,
+                 ("%.2f m" % args.dist) if args.dist else "a known distance"),
+              file=sys.stderr)
+        got = ble_calibrate_samples(args)
+        if not got:
+            print("No advertisements heard. Check `hciconfig hci%d up`, and "
+                  "that the target is advertising (a device already paired and "
+                  "connected does not advertise)." % args.ble_dev,
+                  file=sys.stderr)
+            return 1
+        return _calibrate_report(args, got)
+
     if not args.iface:
-        print("calibrate needs one --iface name@channel", file=sys.stderr)
+        print("calibrate needs one --iface name@channel (or --ble)",
+              file=sys.stderr)
         return 2
     name, ch = parse_iface(args.iface[0])
     if args.setup:
@@ -329,6 +399,10 @@ def calibrate(args):
               "target is transmitting on this channel.", file=sys.stderr)
         return 1
 
+    return _calibrate_report(args, got)
+
+
+def _calibrate_report(args, got):
     rows = []
     for mac, rec in got.items():
         rows.append((mac, _median(rec["rssi"]), len(rec["rssi"]), rec["name"]))
@@ -359,6 +433,12 @@ def calibrate(args):
               % (a1m, args.exponent))
         print('  -> "path_loss": { "rssi_at_1m": %.1f, "exponent": %.1f }'
               % (a1m, args.exponent))
+        print("  -> unifi-hamina-live .env:  %s=%.1f"
+              % ("SENSOR_BLE_RSSI_AT_1M" if args.ble else "SENSOR_RSSI_AT_1M",
+                 a1m))
+        print("\n  Two distances give you the EXPONENT as well, which is the "
+              "\n  number that describes the building. Run again at a second "
+              "\n  distance and feed both to --solve-exponent.")
     if args.ref is not None:
         offset = args.ref - med
         print("Per-sensor offset vs ref %.1f dBm = %.1f"
@@ -721,6 +801,11 @@ def main(argv=None):
                    help="--calibrate: known target distance in m (derives rssi_at_1m)")
     p.add_argument("--exponent", type=float, default=3.0,
                    help="--calibrate: assumed path-loss exponent (default 3.0)")
+    p.add_argument("--solve-exponent", metavar="D1:R1,D2:R2", default="",
+                   help="two measurements at different distances, e.g. "
+                        "'1:-55,8:-78' — solves rssi_at_1m AND the exponent. "
+                        "One distance can only give the intercept for an "
+                        "assumed exponent.")
     p.add_argument("--ref", type=float, default=None,
                    help="--calibrate: reference median dBm (derives rssi_offset)")
     p.add_argument("-v", "--verbose", action="store_true")
@@ -729,6 +814,23 @@ def main(argv=None):
 
     if args.selftest:
         return 0 if (selftest() == 0 and _ble_selftest()) else 1
+    if args.solve_exponent:
+        try:
+            (d1, r1), (d2, r2) = [tuple(float(v) for v in pair.split(":"))
+                                  for pair in args.solve_exponent.split(",")]
+            a1m, n = solve_two_point(d1, r1, d2, r2)
+        except (ValueError, TypeError) as exc:
+            print("--solve-exponent wants D1:R1,D2:R2 — %s" % exc,
+                  file=sys.stderr)
+            return 2
+        print("rssi_at_1m = %.1f dBm   exponent = %.2f" % (a1m, n))
+        print("  SENSOR_BLE_RSSI_AT_1M=%.1f" % a1m)
+        print("  SENSOR_BLE_PATHLOSS_EXPONENT=%.2f" % n)
+        if not 1.5 <= n <= 6.0:
+            print("\n  WARNING: an exponent outside 1.5-6 is not a building. "
+                  "Free space is 2, a house is 3-4. Check the distances were "
+                  "right and far enough apart.", file=sys.stderr)
+        return 0
     if args.calibrate:
         return calibrate(args)
     if not args.collector or not args.id:
