@@ -219,3 +219,51 @@ class HciFilterStruct(unittest.TestCase):
         from rssi_sensor import hci_filter
         _t, lo, hi, _o = _s.unpack("<LLLH2x", hci_filter(0x05))
         self.assertEqual((lo, hi), (1 << 5, 0))
+
+
+class TwoPointSolve(unittest.TestCase):
+    """Deriving both path-loss constants from two measurements.
+
+    A single distance only gives the intercept for an ASSUMED exponent, and the
+    exponent is the number that describes the building. Deployed with guessed
+    constants, real bulbs came back 11-16 m away inside a 21 m house.
+    """
+
+    def test_it_recovers_a_model_it_was_given(self):
+        import math
+        from rssi_sensor import solve_two_point
+        for a_true, n_true in ((-55.0, 3.0), (-40.0, 2.0), (-62.5, 4.2)):
+            r = lambda d: a_true - 10.0 * n_true * math.log10(d)
+            a, n = solve_two_point(1.0, r(1.0), 8.0, r(8.0))
+            self.assertAlmostEqual(a, a_true, places=6)
+            self.assertAlmostEqual(n, n_true, places=6)
+
+    def test_the_intercept_is_the_reading_at_one_metre(self):
+        from rssi_sensor import solve_two_point
+        a, _n = solve_two_point(1.0, -55.0, 8.0, -78.0)
+        self.assertAlmostEqual(a, -55.0, places=6)
+
+    def test_equal_distances_are_refused(self):
+        from rssi_sensor import solve_two_point
+        with self.assertRaises(ValueError):
+            solve_two_point(3.0, -60.0, 3.0, -62.0)
+
+    def test_non_positive_distances_are_refused(self):
+        from rssi_sensor import solve_two_point
+        for bad in ((0.0, 5.0), (5.0, -1.0)):
+            with self.assertRaises(ValueError):
+                solve_two_point(bad[0], -50.0, bad[1], -60.0)
+
+    def test_close_distances_amplify_noise_into_the_exponent(self):
+        """Why the help text says to spread the measurements out.
+
+        One dB of noise over a 1->2 m span moves the exponent far more than the
+        same dB over 1->16 m. This is not a bug to fix; it is the reason the
+        instruction exists, and it is worth pinning so nobody 'simplifies' it.
+        """
+        import math
+        from rssi_sensor import solve_two_point
+        r = lambda d: -55.0 - 30.0 * math.log10(d)
+        _a, n_near = solve_two_point(1.0, r(1.0), 2.0, r(2.0) + 1.0)
+        _a, n_far = solve_two_point(1.0, r(1.0), 16.0, r(16.0) + 1.0)
+        self.assertGreater(abs(n_near - 3.0), abs(n_far - 3.0) * 3)
