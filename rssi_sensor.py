@@ -19,6 +19,7 @@ radiotap/802.11 parser and exits. Standard library only, Python 3.7+.
 """
 
 import argparse
+import errno
 import json
 import math
 import os
@@ -592,9 +593,30 @@ def ble_capture(batch, args, stop):
     # passive scan, 10 ms window every 10 ms — duplicates ON, because every
     # repeat advertisement is another RSSI sample and averaging them is the
     # entire point.
-    sock.send(_hci_cmd(0x08, 0x000B,
-                       struct.pack("<BHHBB", 0x00, 0x0010, 0x0010, 0x00, 0x00)))
-    sock.send(_hci_cmd(0x08, 0x000C, struct.pack("<BB", 0x01, 0x00)))
+    # Binding an HCI socket succeeds on an adapter that is DOWN; only the first
+    # command fails, with ENETDOWN, in a thread — so without this the scan dies
+    # with a bare traceback and the process carries on reporting nothing.
+    try:
+        sock.send(_hci_cmd(0x08, 0x000B,
+                           struct.pack("<BHHBB", 0x00, 0x0010, 0x0010,
+                                       0x00, 0x00)))
+        sock.send(_hci_cmd(0x08, 0x000C, struct.pack("<BB", 0x01, 0x00)))
+    except OSError as exc:
+        if exc.errno == errno.ENETDOWN:
+            print("[ble] hci%d is present but DOWN — run:\n"
+                  "        sudo rfkill unblock bluetooth && sudo hciconfig hci%d up"
+                  % (args.ble_dev, args.ble_dev), file=sys.stderr)
+        elif exc.errno in (errno.EPERM, errno.EACCES):
+            print("[ble] not permitted on hci%d — run as root"
+                  % args.ble_dev, file=sys.stderr)
+        elif exc.errno == errno.EBUSY:
+            print("[ble] hci%d is busy — another scan is running "
+                  "(bluetoothctl, or a second copy of this)" % args.ble_dev,
+                  file=sys.stderr)
+        else:
+            print("[ble] could not start the scan on hci%d: %s"
+                  % (args.ble_dev, exc), file=sys.stderr)
+        return
     if args.verbose:
         print("[ble] scanning on hci%d" % args.ble_dev, file=sys.stderr)
     sock.settimeout(1.0)

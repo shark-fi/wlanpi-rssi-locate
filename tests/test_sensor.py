@@ -5,6 +5,7 @@ Stdlib only, no test framework to install:
     python3 -m unittest discover -s tests -v
 """
 import argparse
+import threading
 import os
 import sys
 import unittest
@@ -267,3 +268,67 @@ class TwoPointSolve(unittest.TestCase):
         _a, n_near = solve_two_point(1.0, r(1.0), 2.0, r(2.0) + 1.0)
         _a, n_far = solve_two_point(1.0, r(1.0), 16.0, r(16.0) + 1.0)
         self.assertGreater(abs(n_near - 3.0), abs(n_far - 3.0) * 3)
+
+
+class BleStartFailures(unittest.TestCase):
+    """Starting the scan, when the adapter will not.
+
+    Binding an HCI socket SUCCEEDS on an adapter that is down — only the first
+    command fails, with ENETDOWN, inside a thread. Before this the scan died
+    with a bare traceback while the process carried on reporting nothing, on a
+    Pi that looked like it was running.
+    """
+
+    def _run_with(self, err):
+        """Drive ble_capture with a socket whose send() raises `err`."""
+        import errno as E
+        import io
+        import contextlib
+        import rssi_sensor as rs
+
+        class _Sock:
+            def bind(self, *a): pass
+            def setsockopt(self, *a): pass
+            def settimeout(self, *a): pass
+            def send(self, *a): raise OSError(err, "boom")
+            def close(self): pass
+
+        # AF_BLUETOOTH/BTPROTO_HCI are Linux-only, and these tests run
+        # anywhere. Supplying them keeps the test about the FAILURE HANDLING
+        # rather than about which OS is running it.
+        saved = {k: getattr(rs.socket, k, None)
+                 for k in ("socket", "AF_BLUETOOTH", "BTPROTO_HCI")}
+        rs.socket.socket = lambda *a, **k: _Sock()
+        rs.socket.AF_BLUETOOTH = getattr(rs.socket, "AF_BLUETOOTH", 31)
+        rs.socket.BTPROTO_HCI = getattr(rs.socket, "BTPROTO_HCI", 1)
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(buf):
+                rs.ble_capture(None, argparse.Namespace(ble_dev=0, verbose=False),
+                               threading.Event())
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    delattr(rs.socket, k)
+                else:
+                    setattr(rs.socket, k, v)
+        return buf.getvalue()
+
+    def test_a_down_adapter_says_how_to_bring_it_up(self):
+        import errno as E
+        out = self._run_with(E.ENETDOWN)
+        self.assertIn("DOWN", out)
+        self.assertIn("hciconfig hci0 up", out)
+
+    def test_permission_says_root(self):
+        import errno as E
+        self.assertIn("root", self._run_with(E.EPERM))
+
+    def test_busy_names_the_other_scanner(self):
+        import errno as E
+        self.assertIn("busy", self._run_with(E.EBUSY))
+
+    def test_an_unknown_errno_still_reports_rather_than_raising(self):
+        import errno as E
+        out = self._run_with(E.EIO)
+        self.assertIn("could not start the scan", out)
